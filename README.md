@@ -22,7 +22,7 @@ global):
 OpenCode installs the plugin on next start. Pin to a tag or commit if you want
 a fixed version, e.g. `"github:cwirz/opencode-dynamic-context-pruning#v3.1.13"`.
 
-The built `dist/` is committed, so no build step is required on install.
+The built `dist/index.js` is committed, so install needs no build step.
 
 ## Project Status
 
