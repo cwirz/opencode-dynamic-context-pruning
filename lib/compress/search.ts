@@ -156,7 +156,10 @@ export function resolveSelection(
     const selectedMessageIds = new Set(messageIds)
     const summariesInSelection: Array<{ blockId: number; rawIndex: number }> = []
     for (const summary of context.summaryByBlockId.values()) {
-        if (!selectedMessageIds.has(summary.anchorMessageId)) {
+        const overlapsSelection = summary.effectiveMessageIds.some((messageId) =>
+            selectedMessageIds.has(messageId),
+        )
+        if (!overlapsSelection) {
             continue
         }
 

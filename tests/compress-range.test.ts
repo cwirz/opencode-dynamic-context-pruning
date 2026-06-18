@@ -77,6 +77,22 @@ function textPart(messageID: string, sessionID: string, id: string, text: string
     }
 }
 
+function toolPart(messageID: string, sessionID: string, callID: string, toolName: string, output: string) {
+    return {
+        id: `${callID}-part`,
+        messageID,
+        sessionID,
+        type: "tool" as const,
+        tool: toolName,
+        callID,
+        state: {
+            status: "completed" as const,
+            input: { name: "demo" },
+            output,
+        },
+    }
+}
+
 function buildMessages(sessionID: string): WithParts[] {
     return [
         {
@@ -382,4 +398,156 @@ test("compress range mode rejects overlapping batched ranges", async () => {
     )
 
     assert.equal(state.prune.messages.blocksById.size, 0)
+})
+
+test("compress range mode recompresses active blocks without copying prior summaries", async () => {
+    const sessionID = `ses_range_recompress_${Date.now()}`
+    const rawMessages: WithParts[] = [
+        {
+            info: {
+                id: "msg-user-1",
+                role: "user",
+                sessionID,
+                agent: "assistant",
+                model: { providerID: "anthropic", modelID: "claude-test" },
+                time: { created: 1 },
+            } as WithParts["info"],
+            parts: [textPart("msg-user-1", sessionID, "part-user-1", "Investigate old details")],
+        },
+        {
+            info: {
+                id: "msg-assistant-1",
+                role: "assistant",
+                sessionID,
+                agent: "assistant",
+                time: { created: 2 },
+            } as WithParts["info"],
+            parts: [textPart("msg-assistant-1", sessionID, "part-assistant-1", "OLD_VERBOSE_DETAIL")],
+        },
+        {
+            info: {
+                id: "msg-user-2",
+                role: "user",
+                sessionID,
+                agent: "assistant",
+                model: { providerID: "anthropic", modelID: "claude-test" },
+                time: { created: 3 },
+            } as WithParts["info"],
+            parts: [textPart("msg-user-2", sessionID, "part-user-2", "Keep only the decision")],
+        },
+    ]
+
+    const state = createSessionState()
+    const logger = new Logger(false)
+    const tool = createCompressRangeTool({
+        client: {
+            session: {
+                messages: async () => ({ data: rawMessages }),
+                get: async () => ({ data: { parentID: null } }),
+            },
+        },
+        state,
+        logger,
+        config: buildConfig(),
+        prompts: {
+            reload() {},
+            getRuntimePrompts() {
+                return { compressRange: "", compressMessage: "" }
+            },
+        },
+    } as any)
+
+    await tool.execute(
+        {
+            topic: "Initial verbose block",
+            content: [
+                {
+                    startId: "m0001",
+                    endId: "m0002",
+                    summary: "OLD_VERBOSE_DETAIL should be removed on recompress.",
+                },
+            ],
+        },
+        { ask: async () => {}, metadata: () => {}, sessionID, messageID: "msg-compress-1" },
+    )
+
+    await tool.execute(
+        {
+            topic: "Recompressed block",
+            content: [
+                {
+                    startId: "b1",
+                    endId: "m0003",
+                    summary: "Decision kept; verbose old details intentionally dropped.",
+                },
+            ],
+        },
+        { ask: async () => {}, metadata: () => {}, sessionID, messageID: "msg-compress-2" },
+    )
+
+    const first = state.prune.messages.blocksById.get(1)
+    const second = state.prune.messages.blocksById.get(2)
+
+    assert.equal(first?.active, false)
+    assert.equal(first?.deactivatedByBlockId, 2)
+    assert.deepEqual(second?.consumedBlockIds, [1])
+    assert.match(second?.summary || "", /Decision kept/)
+    assert.doesNotMatch(second?.summary || "", /OLD_VERBOSE_DETAIL/)
+})
+
+test("compress range mode does not append environment-managed tool output by default", async () => {
+    const sessionID = `ses_range_skip_managed_tools_${Date.now()}`
+    const rawMessages: WithParts[] = [
+        {
+            info: {
+                id: "msg-assistant-1",
+                role: "assistant",
+                sessionID,
+                agent: "assistant",
+                time: { created: 1 },
+            } as WithParts["info"],
+            parts: [
+                textPart("msg-assistant-1", sessionID, "part-assistant-1", "Loaded skill."),
+                toolPart("msg-assistant-1", sessionID, "call-skill", "skill", "HUGE_SKILL_DUMP"),
+            ],
+        },
+    ]
+
+    const state = createSessionState()
+    const logger = new Logger(false)
+    const tool = createCompressRangeTool({
+        client: {
+            session: {
+                messages: async () => ({ data: rawMessages }),
+                get: async () => ({ data: { parentID: null } }),
+            },
+        },
+        state,
+        logger,
+        config: buildConfig(),
+        prompts: {
+            reload() {},
+            getRuntimePrompts() {
+                return { compressRange: "", compressMessage: "" }
+            },
+        },
+    } as any)
+
+    await tool.execute(
+        {
+            topic: "Managed tool output",
+            content: [
+                {
+                    startId: "m0001",
+                    endId: "m0001",
+                    summary: "Skill was loaded; no full tool dump needed.",
+                },
+            ],
+        },
+        { ask: async () => {}, metadata: () => {}, sessionID, messageID: "msg-compress-skill" },
+    )
+
+    const block = Array.from(state.prune.messages.blocksById.values())[0]
+    assert.match(block?.summary || "", /Skill was loaded/)
+    assert.doesNotMatch(block?.summary || "", /HUGE_SKILL_DUMP/)
 })

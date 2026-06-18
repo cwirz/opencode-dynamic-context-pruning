@@ -9,13 +9,11 @@ import {
     appendProtectedUserMessages,
 } from "./protected-content"
 import {
-    appendMissingBlockSummaries,
-    injectBlockPlaceholders,
+    collectConsumedBlockIds,
     parseBlockPlaceholders,
     resolveRanges,
     validateArgs,
     validateNonOverlapping,
-    validateSummaryPlaceholders,
 } from "./range-utils"
 import {
     COMPRESSED_BLOCK_HEADER,
@@ -88,24 +86,14 @@ export function createCompressRangeTool(ctx: ToolContext): ReturnType<typeof too
 
             for (const plan of resolvedPlans) {
                 const parsedPlaceholders = parseBlockPlaceholders(plan.entry.summary)
-                const missingBlockIds = validateSummaryPlaceholders(
-                    parsedPlaceholders,
+                const consumedBlockIds = collectConsumedBlockIds(
                     plan.selection.requiredBlockIds,
-                    plan.selection.startReference,
-                    plan.selection.endReference,
-                    searchContext.summaryByBlockId,
-                )
-
-                const injected = injectBlockPlaceholders(
-                    plan.entry.summary,
                     parsedPlaceholders,
                     searchContext.summaryByBlockId,
-                    plan.selection.startReference,
-                    plan.selection.endReference,
                 )
 
                 const summaryWithUsers = appendProtectedUserMessages(
-                    injected.expandedSummary,
+                    plan.entry.summary,
                     plan.selection,
                     searchContext,
                     ctx.state,
@@ -131,19 +119,12 @@ export function createCompressRangeTool(ctx: ToolContext): ReturnType<typeof too
                     ctx.config.protectedFilePatterns,
                 )
 
-                const completedSummary = appendMissingBlockSummaries(
-                    summaryWithTools,
-                    missingBlockIds,
-                    searchContext.summaryByBlockId,
-                    injected.consumedBlockIds,
-                )
-
                 preparedPlans.push({
                     entry: plan.entry,
                     selection: plan.selection,
                     anchorMessageId: plan.anchorMessageId,
-                    finalSummary: completedSummary.expandedSummary,
-                    consumedBlockIds: completedSummary.consumedBlockIds,
+                    finalSummary: summaryWithTools,
+                    consumedBlockIds,
                 })
             }
 
@@ -173,6 +154,18 @@ export function createCompressRangeTool(ctx: ToolContext): ReturnType<typeof too
                     storedSummary,
                     preparedPlan.consumedBlockIds,
                 )
+
+                await ctx.logger.info("Applied range compression", {
+                    blockId,
+                    runId,
+                    startId: preparedPlan.entry.startId,
+                    endId: preparedPlan.entry.endId,
+                    summaryTokens,
+                    compressedTokens: applied.compressedTokens,
+                    includedBlockIds: preparedPlan.selection.requiredBlockIds,
+                    consumedBlockIds: preparedPlan.consumedBlockIds,
+                    directMessages: applied.messageIds.length,
+                })
 
                 totalCompressedMessages += applied.messageIds.length
 

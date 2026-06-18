@@ -9,13 +9,20 @@ Automatically reduces token usage in OpenCode by managing conversation context.
 
 ## Installation
 
-Install from the CLI:
+This is a fork. Install it directly from GitHub by adding the repo to the
+`plugin` array in your OpenCode config (`~/.config/opencode/opencode.json` for
+global):
 
-```bash
-opencode plugin @tarquinen/opencode-dcp@latest --global
+```json
+{
+  "plugin": ["github:cwirz/opencode-dynamic-context-pruning"]
+}
 ```
 
-This installs the package and adds it to your global OpenCode config.
+OpenCode installs the plugin on next start. Pin to a tag or commit if you want
+a fixed version, e.g. `"github:cwirz/opencode-dynamic-context-pruning#v3.1.13"`.
+
+The built `dist/` is committed, so no build step is required on install.
 
 ## Project Status
 

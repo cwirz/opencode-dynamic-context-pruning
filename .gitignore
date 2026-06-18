@@ -3,7 +3,7 @@ node_modules/
 bun.lock
 
 # Build output
-dist/
+# dist/ committed so the plugin is installable directly via github: without a build step
 *.tgz
 
 # Logs

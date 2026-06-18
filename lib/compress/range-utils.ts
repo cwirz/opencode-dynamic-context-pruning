@@ -223,6 +223,32 @@ export function injectBlockPlaceholders(
     }
 }
 
+export function collectConsumedBlockIds(
+    requiredBlockIds: number[],
+    placeholders: ParsedBlockPlaceholder[],
+    summaryByBlockId: Map<number, CompressionBlock>,
+): number[] {
+    const consumed: number[] = []
+    const seen = new Set<number>()
+
+    const add = (blockId: number): void => {
+        if (seen.has(blockId) || !summaryByBlockId.has(blockId)) {
+            return
+        }
+        seen.add(blockId)
+        consumed.push(blockId)
+    }
+
+    for (const blockId of requiredBlockIds) {
+        add(blockId)
+    }
+    for (const placeholder of placeholders) {
+        add(placeholder.blockId)
+    }
+
+    return consumed
+}
+
 export function appendMissingBlockSummaries(
     summary: string,
     missingBlockIds: number[],
