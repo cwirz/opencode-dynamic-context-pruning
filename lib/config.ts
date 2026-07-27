@@ -3,6 +3,7 @@ import { join, dirname } from "path"
 import { homedir } from "os"
 import { parse } from "jsonc-parser/lib/esm/main.js"
 import type { PluginInput } from "@opencode-ai/plugin"
+import { DEFAULT_ALLOW_SUBAGENTS } from "./subagent-policy"
 
 type Permission = "ask" | "allow" | "deny"
 type CompressMode = "range" | "message"
@@ -672,7 +673,7 @@ const defaultConfig: PluginConfig = {
         turns: 4,
     },
     experimental: {
-        allowSubAgents: false,
+        allowSubAgents: DEFAULT_ALLOW_SUBAGENTS,
         customPrompts: false,
     },
     protectedFilePatterns: [],

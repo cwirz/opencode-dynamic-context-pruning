@@ -862,6 +862,17 @@ var ParseErrorCode;
   ParseErrorCode2[ParseErrorCode2["InvalidCharacter"] = 16] = "InvalidCharacter";
 })(ParseErrorCode || (ParseErrorCode = {}));
 
+// lib/subagent-policy.ts
+var DEFAULT_ALLOW_SUBAGENTS = true;
+function restrictCompressToPrimaryAgents(opencodeConfig, compressEnabled, allowSubAgents) {
+  if (!compressEnabled || allowSubAgents) return;
+  const existingPrimaryTools = opencodeConfig.experimental?.primary_tools ?? [];
+  opencodeConfig.experimental = {
+    ...opencodeConfig.experimental,
+    primary_tools: [...existingPrimaryTools, "compress"]
+  };
+}
+
 // lib/config.ts
 var DEFAULT_PROTECTED_TOOLS = [
   "task",
@@ -1326,7 +1337,7 @@ var defaultConfig = {
     turns: 4
   },
   experimental: {
-    allowSubAgents: false,
+    allowSubAgents: DEFAULT_ALLOW_SUBAGENTS,
     customPrompts: false
   },
   protectedFilePatterns: [],
@@ -1676,6 +1687,41 @@ var isIgnoredUserMessage = (message) => {
   }
   return true;
 };
+function removeIgnoredUserMessages(messages) {
+  const kept = messages.filter((message) => !isIgnoredUserMessage(message));
+  const removed = messages.length - kept.length;
+  if (removed > 0) {
+    messages.length = 0;
+    messages.push(...kept);
+  }
+  return removed;
+}
+var COMPRESSED_SUMMARY_PLACEHOLDER = "[summary stored in compressed context block]";
+function minimizeCompletedCompressInputs(messages) {
+  let minimized = 0;
+  for (const message of messages) {
+    if (!messageHasCompress(message)) {
+      continue;
+    }
+    for (const part of message.parts) {
+      if (part.type !== "tool" || part.tool !== "compress" || part.state?.status !== "completed") {
+        continue;
+      }
+      const content = part.state.input?.content;
+      if (!Array.isArray(content)) {
+        continue;
+      }
+      for (const range of content) {
+        if (typeof range?.summary !== "string" || range.summary === COMPRESSED_SUMMARY_PLACEHOLDER) {
+          continue;
+        }
+        range.summary = COMPRESSED_SUMMARY_PLACEHOLDER;
+        minimized++;
+      }
+    }
+  }
+  return minimized;
+}
 function isProtectedUserMessage(config, message) {
   if (!isMessageWithInfo(message)) {
     return false;
@@ -4360,23 +4406,89 @@ function parseBlockPlaceholders(summary) {
   }
   return placeholders;
 }
-function collectConsumedBlockIds(requiredBlockIds, placeholders, summaryByBlockId) {
-  const consumed = [];
-  const seen = /* @__PURE__ */ new Set();
-  const add = (blockId) => {
-    if (seen.has(blockId) || !summaryByBlockId.has(blockId)) {
-      return;
-    }
-    seen.add(blockId);
-    consumed.push(blockId);
-  };
-  for (const blockId of requiredBlockIds) {
-    add(blockId);
-  }
+function validateSummaryPlaceholders(placeholders, requiredBlockIds, _startReference, _endReference, summaryByBlockId) {
+  const requiredSet = new Set(requiredBlockIds);
+  const keptPlaceholderIds = /* @__PURE__ */ new Set();
+  const validPlaceholders = [];
   for (const placeholder of placeholders) {
-    add(placeholder.blockId);
+    const isKnown = summaryByBlockId.has(placeholder.blockId);
+    const isRequired = requiredSet.has(placeholder.blockId);
+    const isDuplicate = keptPlaceholderIds.has(placeholder.blockId);
+    if (isKnown && isRequired) {
+      validPlaceholders.push(placeholder);
+      if (!isDuplicate) {
+        keptPlaceholderIds.add(placeholder.blockId);
+      }
+    }
   }
-  return consumed;
+  placeholders.length = 0;
+  placeholders.push(...validPlaceholders);
+  return requiredBlockIds.filter((id) => !keptPlaceholderIds.has(id));
+}
+function injectBlockPlaceholders(summary, placeholders, summaryByBlockId, _startReference, _endReference) {
+  let cursor = 0;
+  let expanded = summary;
+  const consumed = [];
+  const consumedSeen = /* @__PURE__ */ new Set();
+  if (placeholders.length > 0) {
+    expanded = "";
+    for (const placeholder of placeholders) {
+      const target = summaryByBlockId.get(placeholder.blockId);
+      if (!target) {
+        throw new Error(`Compressed block not found: (b${placeholder.blockId})`);
+      }
+      expanded += summary.slice(cursor, placeholder.startIndex);
+      cursor = placeholder.endIndex;
+      if (!consumedSeen.has(placeholder.blockId)) {
+        consumedSeen.add(placeholder.blockId);
+        consumed.push(placeholder.blockId);
+      }
+    }
+    expanded += summary.slice(cursor);
+  }
+  return {
+    expandedSummary: expanded.replace(/\n{3,}/g, "\n\n").trim(),
+    consumedBlockIds: consumed
+  };
+}
+function appendMissingBlockSummaries(summary, missingBlockIds, summaryByBlockId, consumedBlockIds) {
+  const consumedSeen = new Set(consumedBlockIds);
+  const consumed = [...consumedBlockIds];
+  const missingSummaries = [];
+  for (const blockId of missingBlockIds) {
+    if (consumedSeen.has(blockId)) {
+      continue;
+    }
+    const target = summaryByBlockId.get(blockId);
+    if (!target) {
+      throw new Error(`Compressed block not found: (b${blockId})`);
+    }
+    missingSummaries.push(`
+### (b${blockId})
+${restoreSummary(target.summary)}`);
+    consumedSeen.add(blockId);
+    consumed.push(blockId);
+  }
+  if (missingSummaries.length === 0) {
+    return {
+      expandedSummary: summary,
+      consumedBlockIds: consumed
+    };
+  }
+  const heading = "\n\nThe following previously compressed summaries were also part of this conversation section:";
+  return {
+    expandedSummary: summary + heading + missingSummaries.join(""),
+    consumedBlockIds: consumed
+  };
+}
+function restoreSummary(summary) {
+  const headerMatch = summary.match(/^\s*\[Compressed conversation(?: section)?(?: b\d+)?\]/i);
+  if (!headerMatch) {
+    return summary;
+  }
+  const afterHeader = summary.slice(headerMatch[0].length);
+  const withoutLeadingBreaks = afterHeader.replace(/^(?:\r?\n)+/, "");
+  return withoutLeadingBreaks.replace(/(?:\r?\n)*<dcp-message-id>b\d+<\/dcp-message-id>\s*$/i, "").replace(/(?:\r?\n)+$/, "");
 }
 
 // lib/compress/range.ts
@@ -4418,13 +4530,28 @@ function createCompressRangeTool(ctx) {
       let totalCompressedMessages = 0;
       for (const plan of resolvedPlans) {
         const parsedPlaceholders = parseBlockPlaceholders(plan.entry.summary);
-        const consumedBlockIds = collectConsumedBlockIds(
-          plan.selection.requiredBlockIds,
+        const missingBlockIds = validateSummaryPlaceholders(
           parsedPlaceholders,
+          plan.selection.requiredBlockIds,
+          plan.selection.startReference,
+          plan.selection.endReference,
           searchContext.summaryByBlockId
         );
-        const summaryWithUsers = appendProtectedUserMessages(
+        const injectedSummary = injectBlockPlaceholders(
           plan.entry.summary,
+          parsedPlaceholders,
+          searchContext.summaryByBlockId,
+          plan.selection.startReference,
+          plan.selection.endReference
+        );
+        const carriedSummary = appendMissingBlockSummaries(
+          injectedSummary.expandedSummary,
+          missingBlockIds,
+          searchContext.summaryByBlockId,
+          injectedSummary.consumedBlockIds
+        );
+        const summaryWithUsers = appendProtectedUserMessages(
+          carriedSummary.expandedSummary,
           plan.selection,
           searchContext,
           ctx.state,
@@ -4452,7 +4579,7 @@ function createCompressRangeTool(ctx) {
           selection: plan.selection,
           anchorMessageId: plan.anchorMessageId,
           finalSummary: summaryWithTools,
-          consumedBlockIds
+          consumedBlockIds: carriedSummary.consumedBlockIds
         });
       }
       const runId = allocateRunId(ctx.state);
@@ -4564,17 +4691,106 @@ var hasExplicitToolPermission = (permissionConfig, tool3) => {
 };
 
 // lib/logger.ts
-import { writeFile as writeFile2, mkdir as mkdir2 } from "fs/promises";
-import { join as join3 } from "path";
+import { writeFile as writeFile3, mkdir as mkdir2 } from "fs/promises";
+import { join as join4 } from "path";
 import { existsSync as existsSync3 } from "fs";
 import { homedir as homedir3 } from "os";
+
+// lib/context-debug.ts
+import { readdir as readdir2, writeFile as writeFile2 } from "fs/promises";
+import { basename, join as join3 } from "path";
+function escapeHtml(value) {
+  return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
+}
+function pretty(value) {
+  if (typeof value === "string") return value;
+  return JSON.stringify(value, null, 2);
+}
+function renderPart(part, index) {
+  const type = part?.type || "unknown";
+  const compressionClass = typeof part?.text === "string" && part.text.includes("[Compressed conversation section]") ? " compression" : "";
+  const visible = type === "text" || type === "reasoning" ? part.text : type === "tool" ? {
+    tool: part.tool,
+    callID: part.callID,
+    status: part.state?.status,
+    input: part.state?.input,
+    output: part.state?.output,
+    error: part.state?.error
+  } : part;
+  return `<section class="part${compressionClass}">
+        <div class="part-title">${escapeHtml(type)} <span>#${index + 1}</span></div>
+        <pre>${escapeHtml(pretty(visible))}</pre>
+        <details><summary>Raw part JSON</summary><pre>${escapeHtml(pretty(part))}</pre></details>
+    </section>`;
+}
+function renderMessage(message, index) {
+  const info = message?.info || {};
+  const role = info.role || "unknown";
+  const id = info.id || info.messageID || "no id";
+  const parts = Array.isArray(message?.parts) ? message.parts : [];
+  const compression = parts.some(
+    (part) => typeof part?.text === "string" && part.text.includes("[Compressed conversation section]")
+  );
+  const tokens = info.tokens ? ` \xB7 tokens ${escapeHtml(
+    [info.tokens.input, info.tokens.output, info.tokens.reasoning].filter((value) => typeof value === "number").join("/")
+  )}` : "";
+  return `<article class="message role-${escapeHtml(role)}${compression ? " has-compression" : ""}">
+        <header><span class="role">${escapeHtml(role)}</span><span>${index + 1} \xB7 ${escapeHtml(id)}${tokens}</span></header>
+        <div class="parts">${parts.map(renderPart).join("") || '<p class="empty">No parts</p>'}</div>
+        <details class="raw"><summary>Raw message JSON</summary><pre>${escapeHtml(pretty(message))}</pre></details>
+    </article>`;
+}
+function renderContextSnapshot(snapshot) {
+  const request = snapshot.request ? `<article class="request"><header>Final chat.params hook payload</header><pre>${escapeHtml(pretty(snapshot.request))}</pre></article>` : '<p class="empty">Final request parameters unavailable for this snapshot.</p>';
+  const system = snapshot.system.map(
+    (prompt, index) => `<article class="system-message"><header>System prompt ${index + 1}</header><pre>${escapeHtml(prompt)}</pre></article>`
+  ).join("");
+  const messages = snapshot.messages.map(renderMessage).join("");
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DCP context \xB7 ${escapeHtml(snapshot.sessionId)}</title>
+<style>
+:root{color-scheme:dark;--bg:#0b0d10;--panel:#141820;--line:#29303d;--text:#e8edf5;--muted:#93a0b4;--accent:#75baff;--user:#9b87f5;--assistant:#4fd1a1;--compression:#f5b942}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}main{width:min(1200px,calc(100% - 32px));margin:24px auto 80px}.toolbar{position:sticky;top:0;z-index:2;background:rgba(11,13,16,.94);backdrop-filter:blur(12px);padding:12px 0 16px;border-bottom:1px solid var(--line)}h1{font:700 22px/1.2 system-ui;margin:0 0 6px}.meta{color:var(--muted);margin-bottom:12px}input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--text);font:inherit}.section-title{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.12em;margin:24px 0 8px}.message,.system-message{border:1px solid var(--line);border-radius:10px;background:var(--panel);margin:10px 0;overflow:hidden}.message>header,.system-message>header{display:flex;gap:12px;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--line);color:var(--muted)}.role{font-weight:700;color:var(--accent)}.role-user .role{color:var(--user)}.role-assistant .role{color:var(--assistant)}.has-compression{border-color:var(--compression)}.parts{padding:4px 12px}.part{padding:10px 0;border-bottom:1px solid var(--line)}.part:last-child{border-bottom:0}.part-title{color:var(--accent);font-weight:700;margin-bottom:6px}.part-title span{color:var(--muted);font-weight:400}.compression .part-title{color:var(--compression)}pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}.system-message pre{padding:12px}.raw,details{color:var(--muted)}.raw{border-top:1px solid var(--line);padding:8px 12px}details pre{color:var(--text);margin-top:8px}.hidden{display:none}.empty{color:var(--muted)}a{color:var(--accent)}
+</style>
+</head>
+<body><main>
+<div class="toolbar"><h1>LLM context snapshot</h1><div class="meta">${escapeHtml(snapshot.capturedAt)} \xB7 ${escapeHtml(snapshot.sessionId)} \xB7 ${snapshot.system.length} system prompts \xB7 ${snapshot.messages.length} messages</div><input id="filter" type="search" placeholder="Filter roles, IDs, summaries, tools, or content\u2026" autofocus></div>
+<div class="section-title">Final request parameters</div>${request}
+<div class="section-title">System context</div>${system || '<p class="empty">System context unavailable for this snapshot.</p>'}
+<div class="section-title">Conversation context</div>${messages || '<p class="empty">No conversation messages.</p>'}
+</main><script>
+const filter=document.querySelector('#filter');filter.addEventListener('input',()=>{const q=filter.value.toLowerCase();document.querySelectorAll('.message,.system-message,.request').forEach(el=>el.classList.toggle('hidden',!el.textContent.toLowerCase().includes(q)))})
+</script></body></html>`;
+}
+async function writeContextViewer(contextDir, fileStem, snapshot) {
+  const html = renderContextSnapshot(snapshot);
+  await Promise.all([
+    writeFile2(join3(contextDir, `${fileStem}.html`), html),
+    writeFile2(join3(contextDir, "latest.html"), html)
+  ]);
+  const snapshots = (await readdir2(contextDir)).filter((name) => /^\d{4}-.*\.html$/.test(name)).sort().reverse();
+  const rows = snapshots.map(
+    (name) => `<li><a href="${escapeHtml(name)}">${escapeHtml(basename(name, ".html"))}</a></li>`
+  ).join("");
+  await writeFile2(
+    join3(contextDir, "index.html"),
+    `<!doctype html><meta charset="utf-8"><title>DCP context history</title><style>body{max-width:900px;margin:40px auto;background:#0b0d10;color:#e8edf5;font:14px/1.7 ui-monospace,monospace}a{color:#75baff}li{margin:4px 0}</style><h1>DCP context history</h1><p>${escapeHtml(snapshot.sessionId)} \xB7 newest first \xB7 <a href="latest.html">latest snapshot</a></p><ol>${rows}</ol>`
+  );
+}
+
+// lib/logger.ts
 var Logger = class {
   logDir;
+  systemBySession = /* @__PURE__ */ new Map();
+  latestSnapshotBySession = /* @__PURE__ */ new Map();
   enabled;
-  constructor(enabled) {
+  constructor(enabled, logDir) {
     this.enabled = enabled;
-    const configHome = process.env.XDG_CONFIG_HOME || join3(homedir3(), ".config");
-    this.logDir = join3(configHome, "opencode", "logs", "dcp");
+    const configHome = process.env.XDG_CONFIG_HOME || join4(homedir3(), ".config");
+    this.logDir = logDir || join4(configHome, "opencode", "logs", "dcp");
   }
   async ensureLogDir() {
     if (!existsSync3(this.logDir)) {
@@ -4629,12 +4845,12 @@ var Logger = class {
       const dataStr = this.formatData(data);
       const logLine = `${timestamp} ${level.padEnd(5)} ${component}: ${message}${dataStr ? " | " + dataStr : ""}
 `;
-      const dailyLogDir = join3(this.logDir, "daily");
+      const dailyLogDir = join4(this.logDir, "daily");
       if (!existsSync3(dailyLogDir)) {
         await mkdir2(dailyLogDir, { recursive: true });
       }
-      const logFile = join3(dailyLogDir, `${(/* @__PURE__ */ new Date()).toISOString().split("T")[0]}.log`);
-      await writeFile2(logFile, logLine, { flag: "a" });
+      const logFile = join4(dailyLogDir, `${(/* @__PURE__ */ new Date()).toISOString().split("T")[0]}.log`);
+      await writeFile3(logFile, logLine, { flag: "a" });
     } catch (error) {
     }
   }
@@ -4654,104 +4870,66 @@ var Logger = class {
     const component = this.getCallerFile(2);
     return this.write("ERROR", component, message, data);
   }
-  /**
-   * Strips unnecessary metadata from messages for cleaner debug logs.
-   *
-   * Removed:
-   * - All IDs (id, sessionID, messageID, parentID)
-   * - summary, path, cost, model, agent, mode, finish, providerID, modelID
-   * - step-start and step-finish parts entirely
-   * - snapshot fields
-   * - ignored text parts
-   *
-   * Kept:
-   * - role, time (created only), tokens (input, output, reasoning, cache)
-   * - text, reasoning, tool parts with content
-   * - tool calls with: tool, callID, input, output, metadata
-   */
-  minimizeForDebug(messages) {
-    return messages.map((msg) => {
-      const minimized = {
-        role: msg.info?.role
-      };
-      if (msg.info?.time?.created) {
-        minimized.time = msg.info.time.created;
+  async captureSystemContext(sessionId, system) {
+    if (!this.enabled) return;
+    const capturedSystem = [...system];
+    this.systemBySession.set(sessionId, capturedSystem);
+    const latest = this.latestSnapshotBySession.get(sessionId);
+    if (!latest || Date.now() - latest.savedAt > 5e3) return;
+    try {
+      latest.snapshot.system = capturedSystem;
+      await writeFile3(
+        join4(latest.contextDir, `${latest.fileStem}.json`),
+        JSON.stringify(latest.snapshot, null, 2)
+      );
+      await writeContextViewer(latest.contextDir, latest.fileStem, latest.snapshot);
+    } catch (error) {
+    }
+  }
+  async captureRequestContext(sessionId, input, output) {
+    if (!this.enabled) return;
+    const latest = this.latestSnapshotBySession.get(sessionId);
+    if (!latest || Date.now() - latest.savedAt > 5e3) return;
+    try {
+      latest.snapshot.request = { input, output };
+      const finalInstructions = output?.options?.instructions;
+      if (typeof finalInstructions === "string") {
+        latest.snapshot.system = [finalInstructions];
+        this.systemBySession.set(sessionId, [finalInstructions]);
       }
-      if (msg.info?.tokens) {
-        minimized.tokens = {
-          input: msg.info.tokens.input,
-          output: msg.info.tokens.output,
-          reasoning: msg.info.tokens.reasoning,
-          cache: msg.info.tokens.cache
-        };
-      }
-      if (msg.parts) {
-        minimized.parts = msg.parts.map((part) => {
-          if (part.type === "step-start" || part.type === "step-finish") {
-            return null;
-          }
-          if (part.type === "text") {
-            if (part.ignored) return null;
-            const textPart = { type: "text", text: part.text };
-            if (part.metadata) textPart.metadata = part.metadata;
-            return textPart;
-          }
-          if (part.type === "reasoning") {
-            const reasoningPart = { type: "reasoning", text: part.text };
-            if (part.metadata) reasoningPart.metadata = part.metadata;
-            return reasoningPart;
-          }
-          if (part.type === "tool") {
-            const toolPart = {
-              type: "tool",
-              tool: part.tool,
-              callID: part.callID
-            };
-            if (part.state?.status) {
-              toolPart.status = part.state.status;
-            }
-            if (part.state?.input) {
-              toolPart.input = part.state.input;
-            }
-            if (part.state?.output) {
-              toolPart.output = part.state.output;
-            }
-            if (part.state?.error) {
-              toolPart.error = part.state.error;
-            }
-            if (part.metadata) {
-              toolPart.metadata = part.metadata;
-            }
-            if (part.state?.metadata) {
-              toolPart.metadata = {
-                ...toolPart.metadata || {},
-                ...part.state.metadata
-              };
-            }
-            if (part.state?.title) {
-              toolPart.title = part.state.title;
-            }
-            return toolPart;
-          }
-          return null;
-        }).filter(Boolean);
-      }
-      return minimized;
-    });
+      await writeFile3(
+        join4(latest.contextDir, `${latest.fileStem}.json`),
+        JSON.stringify(latest.snapshot, null, 2)
+      );
+      await writeContextViewer(latest.contextDir, latest.fileStem, latest.snapshot);
+    } catch (error) {
+    }
   }
   async saveContext(sessionId, messages) {
     if (!this.enabled) return;
     try {
-      const contextDir = join3(this.logDir, "context", sessionId);
+      const contextDir = join4(this.logDir, "context", sessionId);
       if (!existsSync3(contextDir)) {
         await mkdir2(contextDir, { recursive: true });
       }
-      const minimized = this.minimizeForDebug(messages).filter(
-        (msg) => msg.parts && msg.parts.length > 0
-      );
-      const timestamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
-      const contextFile = join3(contextDir, `${timestamp}.json`);
-      await writeFile2(contextFile, JSON.stringify(minimized, null, 2));
+      const capturedAt = (/* @__PURE__ */ new Date()).toISOString();
+      const timestamp = capturedAt.replace(/[:.]/g, "-");
+      const snapshot = {
+        version: 1,
+        capturedAt,
+        sessionId,
+        system: this.systemBySession.get(sessionId) || [],
+        messages
+      };
+      const contextFile = join4(contextDir, `${timestamp}.json`);
+      await writeFile3(contextFile, JSON.stringify(snapshot, null, 2));
+      await writeContextViewer(contextDir, timestamp, snapshot);
+      this.latestSnapshotBySession.set(sessionId, {
+        contextDir,
+        fileStem: timestamp,
+        snapshot,
+        savedAt: Date.now()
+      });
     } catch (error) {
     }
   }
@@ -4759,7 +4937,7 @@ var Logger = class {
 
 // lib/prompts/store.ts
 import { existsSync as existsSync4, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2, statSync as statSync2 } from "fs";
-import { join as join4, dirname as dirname2 } from "path";
+import { join as join5, dirname as dirname2 } from "path";
 import { homedir as homedir4 } from "os";
 
 // lib/prompts/system.ts
@@ -4806,6 +4984,7 @@ Your summary must be EXHAUSTIVE. Capture file paths, function signatures, decisi
 USER INTENT FIDELITY
 When the compressed range includes user messages, preserve the user's intent with extra care. Do not change scope, constraints, priorities, acceptance criteria, or requested outcomes.
 Directly quote user messages when they are short enough to include safely. Direct quotes are preferred when they best preserve exact meaning.
+A newer user request does not cancel or pause an unfinished earlier request unless the user says so. Explicitly retain every unfinished task, its status, and its next step so interrupted work resumes after compression.
 
 Yet be LEAN. Strip away the noise: failed attempts that led nowhere, verbose tool outputs, back-and-forth exploration. What remains should be pure signal - golden nuggets of detail that preserve full understanding with zero ambiguity.
 
@@ -4813,7 +4992,23 @@ PROTECTED TOOL OUTPUTS
 Environment-managed/protected tool outputs such as task, skill, todowrite, and todoread are preserved outside your summary. Mention outcomes and decisions from them when relevant, but do not copy their full outputs, schemas, prompts, or skill text into the summary.
 
 PREVIOUSLY COMPRESSED BLOCKS
-When the selected range includes previously compressed blocks, your new summary supersedes them. Read their content, extract only still-needed facts, and write those facts directly into the new summary.
+Previously compressed blocks are durable, high-priority memory, not ordinary conversation history. When the selected range includes one, rewrite its still-relevant information into the new summary. The new block supersedes it.
+
+Before writing the summary:
+
+1. Read every included compressed block in full. Recompress it: merge durable facts and active work into the new summary; remove repetition, superseded status, and obsolete detail.
+2. Identify every unresolved user request, including work interrupted by a newer request. A newer task does not cancel an older task unless the user explicitly says so.
+3. Preserve each task's current state: original intent, acceptance criteria, completed work, remaining work, blockers, and exact next step.
+4. Preserve other still-relevant decisions, constraints, file paths, code details, and findings.
+
+CURRENT STATE
+Prior summaries may contain task statuses that were accurate at an earlier compression boundary. Do not retain stale status prose when newer messages supersede it. Preserve only history needed to explain decisions or resume work.
+
+- Integrate required prior-block content directly into one coherent summary. Do not copy the old summary wholesale.
+- End every summary containing task work with a \`CURRENT STATE (authoritative)\` section.
+- In that final section, list every unfinished task, its present status, blockers, and exact next step.
+- Explicitly mark prior in-progress tasks completed or cancelled when later messages establish that outcome.
+- The final section overrides conflicting or stale status statements preserved from earlier summaries.
 
 Compressed block sections in context are clearly marked with a header:
 
@@ -4823,9 +5018,14 @@ Compressed block IDs use the \`bN\` form (never \`mNNNN\`) and are represented i
 
 Rules:
 
-- Do not use \`(bN)\` placeholders in the summary.
-- Do not copy a previous compressed block verbatim unless every word is still necessary.
-- The summary you write is the complete replacement for raw messages and prior summaries in the selected range.
+- Rewrite all still-relevant information from each included block into the new summary, then include its \`(bN)\` placeholder exactly once as a source acknowledgement. Placeholders are removed; they do not copy old text.
+- If you omit a required placeholder, the plugin safely appends that old summary verbatim. This prevents accidental loss but costs tokens, so always include the marker after integrating its content.
+- Remove duplicated facts, stale task states, obsolete exploration, and superseded implementation detail. Keep unresolved intent, constraints, decisions, current implementation facts, and exact next steps.
+- The resulting summary must replace both raw messages and prior summaries. It may grow when genuinely new durable information appears, but should shrink when old detail becomes redundant or obsolete.
+
+TOKEN-EFFICIENT BOUNDARIES
+- If an older raw message is already fully represented by the summary you are creating, include that message inside the selected range instead of leaving a duplicate outside it.
+- In particular, absorb an earlier opening request when its intent is already preserved in a recompressed block. Never absorb a still-relevant raw message unless its full intent is retained in the new summary.
 
 BOUNDARY IDS
 You specify boundaries by ID using the injected IDs visible in the conversation:
@@ -5046,7 +5246,7 @@ function createBundledRuntimePrompts() {
 function findOpencodeDir2(startDir) {
   let current = startDir;
   while (current !== "/") {
-    const candidate = join4(current, ".opencode");
+    const candidate = join5(current, ".opencode");
     if (existsSync4(candidate)) {
       try {
         if (statSync2(candidate).isDirectory()) {
@@ -5064,13 +5264,13 @@ function findOpencodeDir2(startDir) {
   return null;
 }
 function resolvePromptPaths(workingDirectory) {
-  const configHome = process.env.XDG_CONFIG_HOME || join4(homedir4(), ".config");
-  const globalRoot = join4(configHome, "opencode", "dcp-prompts");
-  const defaultsDir = join4(globalRoot, "defaults");
-  const globalOverridesDir = join4(globalRoot, "overrides");
-  const configDirOverridesDir = process.env.OPENCODE_CONFIG_DIR ? join4(process.env.OPENCODE_CONFIG_DIR, "dcp-prompts", "overrides") : null;
+  const configHome = process.env.XDG_CONFIG_HOME || join5(homedir4(), ".config");
+  const globalRoot = join5(configHome, "opencode", "dcp-prompts");
+  const defaultsDir = join5(globalRoot, "defaults");
+  const globalOverridesDir = join5(globalRoot, "overrides");
+  const configDirOverridesDir = process.env.OPENCODE_CONFIG_DIR ? join5(process.env.OPENCODE_CONFIG_DIR, "dcp-prompts", "overrides") : null;
   const opencodeDir = findOpencodeDir2(workingDirectory);
-  const projectOverridesDir = opencodeDir ? join4(opencodeDir, "dcp-prompts", "overrides") : null;
+  const projectOverridesDir = opencodeDir ? join5(opencodeDir, "dcp-prompts", "overrides") : null;
   return {
     defaultsDir,
     globalOverridesDir,
@@ -5242,16 +5442,16 @@ var PromptStore = class {
     const candidates = [];
     if (this.paths.projectOverridesDir) {
       candidates.push({
-        path: join4(this.paths.projectOverridesDir, fileName)
+        path: join5(this.paths.projectOverridesDir, fileName)
       });
     }
     if (this.paths.configDirOverridesDir) {
       candidates.push({
-        path: join4(this.paths.configDirOverridesDir, fileName)
+        path: join5(this.paths.configDirOverridesDir, fileName)
       });
     }
     candidates.push({
-      path: join4(this.paths.globalOverridesDir, fileName)
+      path: join5(this.paths.globalOverridesDir, fileName)
     });
     return candidates;
   }
@@ -5274,7 +5474,7 @@ var PromptStore = class {
       const managedContent = buildDefaultPromptFileContent(
         bundledEditable || BUNDLED_EDITABLE_PROMPTS[definition.runtimeField]
       );
-      const filePath = join4(this.paths.defaultsDir, definition.fileName);
+      const filePath = join5(this.paths.defaultsDir, definition.fileName);
       try {
         const existing = readFileIfExists(filePath);
         if (existing === managedContent) {
@@ -5288,7 +5488,7 @@ var PromptStore = class {
         });
       }
     }
-    const readmePath = join4(this.paths.defaultsDir, DEFAULTS_README_FILE);
+    const readmePath = join5(this.paths.defaultsDir, DEFAULTS_README_FILE);
     const readmeContent = buildDefaultsReadmeContent();
     try {
       const existing = readFileIfExists(readmePath);
@@ -7332,34 +7532,38 @@ var INTERNAL_AGENT_SIGNATURES = [
 ];
 function createSystemPromptHandler(state, logger, config, prompts) {
   return async (input, output) => {
-    if (input.model?.limit?.context) {
-      state.modelContextLimit = input.model.limit.context;
-      logger.debug("Cached model context limit", { limit: state.modelContextLimit });
-    }
-    if (state.isSubAgent && !config.experimental.allowSubAgents) {
-      return;
-    }
-    const systemText = output.system.join("\n");
-    if (INTERNAL_AGENT_SIGNATURES.some((sig) => systemText.includes(sig))) {
-      logger.info("Skipping DCP system prompt injection for internal agent");
-      return;
-    }
-    const effectivePermission = input.sessionID && state.sessionId === input.sessionID ? compressPermission(state, config) : config.compress.permission;
-    if (effectivePermission === "deny") {
-      return;
-    }
-    prompts.reload();
-    const runtimePrompts = prompts.getRuntimePrompts();
-    const newPrompt = renderSystemPrompt(
-      runtimePrompts,
-      buildProtectedToolsExtension(config.compress.protectedTools),
-      !!state.manualMode,
-      state.isSubAgent && config.experimental.allowSubAgents
-    );
-    if (output.system.length > 0) {
-      output.system[output.system.length - 1] += "\n\n" + newPrompt;
-    } else {
-      output.system.push(newPrompt);
+    try {
+      if (input.model?.limit?.context) {
+        state.modelContextLimit = input.model.limit.context;
+        logger.debug("Cached model context limit", { limit: state.modelContextLimit });
+      }
+      if (state.isSubAgent && !config.experimental.allowSubAgents) {
+        return;
+      }
+      const systemText = output.system.join("\n");
+      if (INTERNAL_AGENT_SIGNATURES.some((sig) => systemText.includes(sig))) {
+        logger.info("Skipping DCP system prompt injection for internal agent");
+        return;
+      }
+      const effectivePermission = input.sessionID && state.sessionId === input.sessionID ? compressPermission(state, config) : config.compress.permission;
+      if (effectivePermission === "deny") {
+        return;
+      }
+      prompts.reload();
+      const runtimePrompts = prompts.getRuntimePrompts();
+      const newPrompt = renderSystemPrompt(
+        runtimePrompts,
+        buildProtectedToolsExtension(config.compress.protectedTools),
+        !!state.manualMode,
+        state.isSubAgent && config.experimental.allowSubAgents
+      );
+      if (output.system.length > 0) {
+        output.system[output.system.length - 1] += "\n\n" + newPrompt;
+      } else {
+        output.system.push(newPrompt);
+      }
+    } finally {
+      if (input.sessionID) await logger.captureSystemContext(input.sessionID, output.system);
     }
   };
 }
@@ -7375,6 +7579,12 @@ function createChatMessageTransformHandler(client, state, logger, config, prompt
     }
     await checkSession(client, state, logger, output.messages, config.manualMode.enabled);
     syncCompressPermissionState(state, config, hostPermissions, output.messages);
+    const removedIgnoredMessages = removeIgnoredUserMessages(output.messages);
+    if (removedIgnoredMessages > 0) {
+      logger.debug("Removed UI-only messages from model context", {
+        removed: removedIgnoredMessages
+      });
+    }
     if (state.isSubAgent && !config.experimental.allowSubAgents) {
       return;
     }
@@ -7405,6 +7615,12 @@ function createChatMessageTransformHandler(client, state, logger, config, prompt
     injectMessageIds(state, config, output.messages, compressionPriorities);
     applyPendingManualTrigger(state, output.messages, logger);
     stripStaleMetadata(output.messages);
+    const minimizedCompressSummaries = minimizeCompletedCompressInputs(output.messages);
+    if (minimizedCompressSummaries > 0) {
+      logger.debug("Minimized completed compress tool history", {
+        summaries: minimizedCompressSummaries
+      });
+    }
     if (state.sessionId) {
       await logger.saveContext(state.sessionId, output.messages);
     }
@@ -7604,7 +7820,7 @@ function configureClientAuth(client) {
 
 // lib/update.ts
 import { readFile as readFile2, rm } from "fs/promises";
-import { basename, dirname as dirname3, join as join5 } from "path";
+import { basename as basename2, dirname as dirname3, join as join6 } from "path";
 import { fileURLToPath } from "url";
 var PACKAGE_NAME = "@tarquinen/opencode-dcp";
 function startAutoUpdate(ctx, enabled) {
@@ -7629,7 +7845,7 @@ function startAutoUpdate(ctx, enabled) {
 async function checkAutoUpdate(signal) {
   const packageDir = await findPackageDir(PACKAGE_NAME);
   if (!packageDir) return { updated: false };
-  const pkg = await readPackageJson(join5(packageDir, "package.json"));
+  const pkg = await readPackageJson(join6(packageDir, "package.json"));
   if (!pkg?.name || !pkg.version) return { updated: false };
   const latest = await fetchLatestVersion(pkg.name, signal);
   if (!latest || !isVersionNewer(latest, pkg.version)) return { updated: false };
@@ -7651,7 +7867,7 @@ async function checkAutoUpdate(signal) {
 async function findPackageDir(name) {
   let dir = dirname3(fileURLToPath(import.meta.url));
   for (; ; ) {
-    const pkg = await readPackageJson(join5(dir, "package.json"));
+    const pkg = await readPackageJson(join6(dir, "package.json"));
     if (pkg?.name === name) return dir;
     const parent = dirname3(dir);
     if (parent === dir) return void 0;
@@ -7660,10 +7876,10 @@ async function findPackageDir(name) {
 }
 async function updateRemoveDir(packageDir, name) {
   const packageParent = dirname3(packageDir);
-  const nodeModulesDir = basename(packageParent).startsWith("@") ? dirname3(packageParent) : packageParent;
-  if (basename(nodeModulesDir) !== "node_modules") return void 0;
+  const nodeModulesDir = basename2(packageParent).startsWith("@") ? dirname3(packageParent) : packageParent;
+  if (basename2(nodeModulesDir) !== "node_modules") return void 0;
   const wrapperDir = dirname3(nodeModulesDir);
-  const wrapperPkg = await readPackageJson(join5(wrapperDir, "package.json"));
+  const wrapperPkg = await readPackageJson(join6(wrapperDir, "package.json"));
   const spec = wrapperSpec(wrapperDir, name) ?? wrapperPkg?.dependencies?.[name];
   if (!spec || !isAutoUpdatableSpec(spec)) return void 0;
   return wrapperDir;
@@ -7671,13 +7887,13 @@ async function updateRemoveDir(packageDir, name) {
 function wrapperSpec(wrapperDir, name) {
   if (name.startsWith("@")) {
     const [scope, pkg] = name.split("/");
-    if (!scope || !pkg || basename(dirname3(wrapperDir)) !== scope) return void 0;
+    if (!scope || !pkg || basename2(dirname3(wrapperDir)) !== scope) return void 0;
     const prefix2 = `${pkg}@`;
-    const base2 = basename(wrapperDir);
+    const base2 = basename2(wrapperDir);
     return base2.startsWith(prefix2) ? base2.slice(prefix2.length) : void 0;
   }
   const prefix = `${name}@`;
-  const base = basename(wrapperDir);
+  const base = basename2(wrapperDir);
   return base.startsWith(prefix) ? base.slice(prefix.length) : void 0;
 }
 function isAutoUpdatableSpec(spec) {
@@ -7775,6 +7991,9 @@ var server = (async (ctx) => {
     prompts
   };
   return {
+    "chat.params": async (input, output) => {
+      await logger.captureRequestContext(input.sessionID, input, output);
+    },
     "experimental.chat.system.transform": createSystemPromptHandler(
       state,
       logger,
@@ -7815,17 +8034,11 @@ var server = (async (ctx) => {
           description: "Trigger DCP manual compression with: /dcp-compress [focus]"
         };
       }
-      const toolsToAdd = [];
-      if (config.compress.permission !== "deny" && !config.experimental.allowSubAgents) {
-        toolsToAdd.push("compress");
-      }
-      if (toolsToAdd.length > 0) {
-        const existingPrimaryTools = opencodeConfig.experimental?.primary_tools ?? [];
-        opencodeConfig.experimental = {
-          ...opencodeConfig.experimental,
-          primary_tools: [...existingPrimaryTools, ...toolsToAdd]
-        };
-      }
+      restrictCompressToPrimaryAgents(
+        opencodeConfig,
+        config.compress.permission !== "deny",
+        config.experimental.allowSubAgents
+      );
       if (!hasExplicitToolPermission(opencodeConfig.permission, "compress")) {
         const permission = opencodeConfig.permission ?? {};
         opencodeConfig.permission = {

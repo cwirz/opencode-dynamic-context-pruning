@@ -127,25 +127,10 @@ export function parseBlockPlaceholders(summary: string): ParsedBlockPlaceholder[
 export function validateSummaryPlaceholders(
     placeholders: ParsedBlockPlaceholder[],
     requiredBlockIds: number[],
-    startReference: BoundaryReference,
-    endReference: BoundaryReference,
+    _startReference: BoundaryReference,
+    _endReference: BoundaryReference,
     summaryByBlockId: Map<number, CompressionBlock>,
 ): number[] {
-    const boundaryOptionalIds = new Set<number>()
-    if (startReference.kind === "compressed-block") {
-        if (startReference.blockId === undefined) {
-            throw new Error("Failed to map boundary matches back to raw messages")
-        }
-        boundaryOptionalIds.add(startReference.blockId)
-    }
-    if (endReference.kind === "compressed-block") {
-        if (endReference.blockId === undefined) {
-            throw new Error("Failed to map boundary matches back to raw messages")
-        }
-        boundaryOptionalIds.add(endReference.blockId)
-    }
-
-    const strictRequiredIds = requiredBlockIds.filter((id) => !boundaryOptionalIds.has(id))
     const requiredSet = new Set(requiredBlockIds)
     const keptPlaceholderIds = new Set<number>()
     const validPlaceholders: ParsedBlockPlaceholder[] = []
@@ -155,24 +140,26 @@ export function validateSummaryPlaceholders(
         const isRequired = requiredSet.has(placeholder.blockId)
         const isDuplicate = keptPlaceholderIds.has(placeholder.blockId)
 
-        if (isKnown && isRequired && !isDuplicate) {
+        if (isKnown && isRequired) {
             validPlaceholders.push(placeholder)
-            keptPlaceholderIds.add(placeholder.blockId)
+            if (!isDuplicate) {
+                keptPlaceholderIds.add(placeholder.blockId)
+            }
         }
     }
 
     placeholders.length = 0
     placeholders.push(...validPlaceholders)
 
-    return strictRequiredIds.filter((id) => !keptPlaceholderIds.has(id))
+    return requiredBlockIds.filter((id) => !keptPlaceholderIds.has(id))
 }
 
 export function injectBlockPlaceholders(
     summary: string,
     placeholders: ParsedBlockPlaceholder[],
     summaryByBlockId: Map<number, CompressionBlock>,
-    startReference: BoundaryReference,
-    endReference: BoundaryReference,
+    _startReference: BoundaryReference,
+    _endReference: BoundaryReference,
 ): InjectedSummaryResult {
     let cursor = 0
     let expanded = summary
@@ -188,7 +175,9 @@ export function injectBlockPlaceholders(
             }
 
             expanded += summary.slice(cursor, placeholder.startIndex)
-            expanded += restoreSummary(target.summary)
+            // The new summary already contains the durable context from this
+            // block. The placeholder acknowledges its source without copying
+            // the old summary verbatim.
             cursor = placeholder.endIndex
 
             if (!consumedSeen.has(placeholder.blockId)) {
@@ -200,25 +189,8 @@ export function injectBlockPlaceholders(
         expanded += summary.slice(cursor)
     }
 
-    expanded = injectBoundarySummary(
-        expanded,
-        startReference,
-        "start",
-        summaryByBlockId,
-        consumed,
-        consumedSeen,
-    )
-    expanded = injectBoundarySummary(
-        expanded,
-        endReference,
-        "end",
-        summaryByBlockId,
-        consumed,
-        consumedSeen,
-    )
-
     return {
-        expandedSummary: expanded,
+        expandedSummary: expanded.replace(/\n{3,}/g, "\n\n").trim(),
         consumedBlockIds: consumed,
     }
 }
@@ -301,34 +273,4 @@ function restoreSummary(summary: string): string {
     return withoutLeadingBreaks
         .replace(/(?:\r?\n)*<dcp-message-id>b\d+<\/dcp-message-id>\s*$/i, "")
         .replace(/(?:\r?\n)+$/, "")
-}
-
-function injectBoundarySummary(
-    summary: string,
-    reference: BoundaryReference,
-    position: "start" | "end",
-    summaryByBlockId: Map<number, CompressionBlock>,
-    consumed: number[],
-    consumedSeen: Set<number>,
-): string {
-    if (reference.kind !== "compressed-block" || reference.blockId === undefined) {
-        return summary
-    }
-    if (consumedSeen.has(reference.blockId)) {
-        return summary
-    }
-
-    const target = summaryByBlockId.get(reference.blockId)
-    if (!target) {
-        throw new Error(`Compressed block not found: (b${reference.blockId})`)
-    }
-
-    const injectedBody = restoreSummary(target.summary)
-    const left = position === "start" ? injectedBody.trim() : summary.trim()
-    const right = position === "start" ? summary.trim() : injectedBody.trim()
-    const next = !left ? right : !right ? left : `${left}\n\n${right}`
-
-    consumedSeen.add(reference.blockId)
-    consumed.push(reference.blockId)
-    return next
 }

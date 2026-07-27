@@ -43,7 +43,7 @@ function createMessageBoundary(messageId: string, rawIndex: number): BoundaryRef
     }
 }
 
-test("compress range placeholder validation keeps valid placeholders and ignores invalid ones", () => {
+test("compress range placeholders consume old blocks without copying their text", () => {
     const summaryByBlockId = new Map([
         [1, createBlock(1, "First compressed summary")],
         [2, createBlock(2, "Second compressed summary")],
@@ -61,7 +61,7 @@ test("compress range placeholder validation keeps valid placeholders and ignores
 
     assert.deepEqual(
         parsed.map((placeholder) => placeholder.blockId),
-        [1],
+        [1, 1],
     )
     assert.equal(missingBlockIds.length, 0)
 
@@ -73,7 +73,8 @@ test("compress range placeholder validation keeps valid placeholders and ignores
         createMessageBoundary("msg-b", 1),
     )
 
-    assert.match(injected.expandedSummary, /First compressed summary/)
+    assert.doesNotMatch(injected.expandedSummary, /First compressed summary/)
+    assert.doesNotMatch(injected.expandedSummary, /\(b1\)/)
     assert.doesNotMatch(injected.expandedSummary, /Second compressed summary/)
     assert.match(injected.expandedSummary, /\(b9\)/)
     assert.match(injected.expandedSummary, /\(b2\)/)
@@ -116,4 +117,18 @@ test("compress range continues by appending required block summaries the model o
     assert.match(finalSummary.expandedSummary, /### \(b1\)/)
     assert.match(finalSummary.expandedSummary, /Recovered compressed summary/)
     assert.deepEqual(finalSummary.consumedBlockIds, [1])
+})
+
+test("compressed block boundaries require acknowledgement markers", () => {
+    const summaryByBlockId = new Map([[1, createBlock(1, "Boundary summary")]])
+    const boundary: BoundaryReference = {
+        kind: "compressed-block",
+        blockId: 1,
+        messageId: "msg-1",
+        rawIndex: 0,
+    }
+
+    const missing = validateSummaryPlaceholders([], [1], boundary, boundary, summaryByBlockId)
+
+    assert.deepEqual(missing, [1])
 })

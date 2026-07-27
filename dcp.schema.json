@@ -106,8 +106,8 @@
             "properties": {
                 "allowSubAgents": {
                     "type": "boolean",
-                    "default": false,
-                    "description": "Allow DCP processing in subagent sessions"
+                    "default": true,
+                    "description": "Allow DCP processing in subagent sessions; set to false to restrict compression to primary agents"
                 },
                 "customPrompts": {
                     "type": "boolean",
@@ -116,7 +116,7 @@
                 }
             },
             "default": {
-                "allowSubAgents": false,
+                "allowSubAgents": true,
                 "customPrompts": false
             }
         },

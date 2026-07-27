@@ -18,6 +18,7 @@ import {
 } from "./lib/hooks"
 import { configureClientAuth, isSecureMode } from "./lib/auth"
 import { startAutoUpdate } from "./lib/update"
+import { restrictCompressToPrimaryAgents } from "./lib/subagent-policy"
 
 const server: Plugin = (async (ctx) => {
     const config = getConfig(ctx)
@@ -54,6 +55,9 @@ const server: Plugin = (async (ctx) => {
     }
 
     return {
+        "chat.params": async (input: any, output: any) => {
+            await logger.captureRequestContext(input.sessionID, input, output)
+        },
         "experimental.chat.system.transform": createSystemPromptHandler(
             state,
             logger,
@@ -102,18 +106,11 @@ const server: Plugin = (async (ctx) => {
                 }
             }
 
-            const toolsToAdd: string[] = []
-            if (config.compress.permission !== "deny" && !config.experimental.allowSubAgents) {
-                toolsToAdd.push("compress")
-            }
-
-            if (toolsToAdd.length > 0) {
-                const existingPrimaryTools = opencodeConfig.experimental?.primary_tools ?? []
-                opencodeConfig.experimental = {
-                    ...opencodeConfig.experimental,
-                    primary_tools: [...existingPrimaryTools, ...toolsToAdd],
-                }
-            }
+            restrictCompressToPrimaryAgents(
+                opencodeConfig,
+                config.compress.permission !== "deny",
+                config.experimental.allowSubAgents,
+            )
 
             if (!hasExplicitToolPermission(opencodeConfig.permission, "compress")) {
                 const permission = opencodeConfig.permission ?? {}

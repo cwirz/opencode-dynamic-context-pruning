@@ -156,6 +156,9 @@ test("prompt store exposes bundled range-mode compress prompt", () => {
 
         assert.match(runtimePrompts.compressRange, /Collapse a range in the conversation/i)
         assert.match(runtimePrompts.compressRange, /PREVIOUSLY COMPRESSED BLOCKS/)
+        assert.match(runtimePrompts.compressRange, /CURRENT STATE \(authoritative\)/)
+        assert.match(runtimePrompts.compressRange, /Placeholders are removed/)
+        assert.match(runtimePrompts.compressRange, /TOKEN-EFFICIENT BOUNDARIES/)
         assert.match(runtimePrompts.compressRange, /BATCHING/)
         assert.match(runtimePrompts.compressRange, /content` array/)
     } finally {

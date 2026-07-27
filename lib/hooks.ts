@@ -38,6 +38,7 @@ import { type HostPermissionSnapshot } from "./host-permissions"
 import { compressPermission, syncCompressPermissionState } from "./compress-permission"
 import { checkSession, ensureSessionInitialized, saveSessionState, syncToolCache } from "./state"
 import { cacheSystemPromptTokens } from "./ui/utils"
+import { minimizeCompletedCompressInputs, removeIgnoredUserMessages } from "./messages/query"
 
 const INTERNAL_AGENT_SIGNATURES = [
     "You are a title generator",
@@ -56,42 +57,46 @@ export function createSystemPromptHandler(
         input: { sessionID?: string; model: { limit: { context: number } } },
         output: { system: string[] },
     ) => {
-        if (input.model?.limit?.context) {
-            state.modelContextLimit = input.model.limit.context
-            logger.debug("Cached model context limit", { limit: state.modelContextLimit })
-        }
+        try {
+            if (input.model?.limit?.context) {
+                state.modelContextLimit = input.model.limit.context
+                logger.debug("Cached model context limit", { limit: state.modelContextLimit })
+            }
 
-        if (state.isSubAgent && !config.experimental.allowSubAgents) {
-            return
-        }
+            if (state.isSubAgent && !config.experimental.allowSubAgents) {
+                return
+            }
 
-        const systemText = output.system.join("\n")
-        if (INTERNAL_AGENT_SIGNATURES.some((sig) => systemText.includes(sig))) {
-            logger.info("Skipping DCP system prompt injection for internal agent")
-            return
-        }
+            const systemText = output.system.join("\n")
+            if (INTERNAL_AGENT_SIGNATURES.some((sig) => systemText.includes(sig))) {
+                logger.info("Skipping DCP system prompt injection for internal agent")
+                return
+            }
 
-        const effectivePermission =
-            input.sessionID && state.sessionId === input.sessionID
-                ? compressPermission(state, config)
-                : config.compress.permission
+            const effectivePermission =
+                input.sessionID && state.sessionId === input.sessionID
+                    ? compressPermission(state, config)
+                    : config.compress.permission
 
-        if (effectivePermission === "deny") {
-            return
-        }
+            if (effectivePermission === "deny") {
+                return
+            }
 
-        prompts.reload()
-        const runtimePrompts = prompts.getRuntimePrompts()
-        const newPrompt = renderSystemPrompt(
-            runtimePrompts,
-            buildProtectedToolsExtension(config.compress.protectedTools),
-            !!state.manualMode,
-            state.isSubAgent && config.experimental.allowSubAgents,
-        )
-        if (output.system.length > 0) {
-            output.system[output.system.length - 1] += "\n\n" + newPrompt
-        } else {
-            output.system.push(newPrompt)
+            prompts.reload()
+            const runtimePrompts = prompts.getRuntimePrompts()
+            const newPrompt = renderSystemPrompt(
+                runtimePrompts,
+                buildProtectedToolsExtension(config.compress.protectedTools),
+                !!state.manualMode,
+                state.isSubAgent && config.experimental.allowSubAgents,
+            )
+            if (output.system.length > 0) {
+                output.system[output.system.length - 1] += "\n\n" + newPrompt
+            } else {
+                output.system.push(newPrompt)
+            }
+        } finally {
+            if (input.sessionID) await logger.captureSystemContext(input.sessionID, output.system)
         }
     }
 }
@@ -117,6 +122,13 @@ export function createChatMessageTransformHandler(
         await checkSession(client, state, logger, output.messages, config.manualMode.enabled)
 
         syncCompressPermissionState(state, config, hostPermissions, output.messages)
+
+        const removedIgnoredMessages = removeIgnoredUserMessages(output.messages)
+        if (removedIgnoredMessages > 0) {
+            logger.debug("Removed UI-only messages from model context", {
+                removed: removedIgnoredMessages,
+            })
+        }
 
         if (state.isSubAgent && !config.experimental.allowSubAgents) {
             return
@@ -149,6 +161,12 @@ export function createChatMessageTransformHandler(
         injectMessageIds(state, config, output.messages, compressionPriorities)
         applyPendingManualTrigger(state, output.messages, logger)
         stripStaleMetadata(output.messages)
+        const minimizedCompressSummaries = minimizeCompletedCompressInputs(output.messages)
+        if (minimizedCompressSummaries > 0) {
+            logger.debug("Minimized completed compress tool history", {
+                summaries: minimizedCompressSummaries,
+            })
+        }
 
         if (state.sessionId) {
             await logger.saveContext(state.sessionId, output.messages)

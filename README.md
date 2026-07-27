@@ -82,7 +82,8 @@ Each level overrides the previous, so project settings take priority over global
     // Automatically update npm-installed DCP when a newer npm latest is available.
     // Version-locked plugin specs are not updated.
     "autoUpdate": true,
-    // Enable debug logging to ~/.config/opencode/logs/dcp/
+    // Enable debug logs plus per-request JSON and HTML context snapshots
+    // under ~/.config/opencode/logs/dcp/context/<session-id>/
     "debug": false,
     // Notification display: "off", "minimal", or "detailed"
     "pruneNotification": "detailed",
@@ -109,8 +110,8 @@ Each level overrides the previous, so project settings take priority over global
     },
     // Experimental settings
     "experimental": {
-        // Allow DCP processing in subagent sessions
-        "allowSubAgents": false,
+        // Allow DCP processing in subagent sessions (set false for primary agents only)
+        "allowSubAgents": true,
         // Enable user-editable prompt overrides under dcp-prompts directories
         // When false (default), prompt override files/directories are ignored
         "customPrompts": false,
@@ -186,6 +187,13 @@ Each level overrides the previous, so project settings take priority over global
     },
 }
 ```
+
+With `debug: true`, DCP records the complete transformed context sent on every model
+request. Open `~/.config/opencode/logs/dcp/context/<session-id>/latest.html` for the
+latest searchable visualization, or `index.html` to browse every request. Matching
+JSON files preserve the exact transformed system prompts, message metadata, parts,
+tool inputs, and tool outputs used for debugging. These local files may contain
+sensitive conversation data.
 
 </details>
 

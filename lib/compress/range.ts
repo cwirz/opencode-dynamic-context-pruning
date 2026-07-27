@@ -9,11 +9,13 @@ import {
     appendProtectedUserMessages,
 } from "./protected-content"
 import {
-    collectConsumedBlockIds,
+    appendMissingBlockSummaries,
+    injectBlockPlaceholders,
     parseBlockPlaceholders,
     resolveRanges,
     validateArgs,
     validateNonOverlapping,
+    validateSummaryPlaceholders,
 } from "./range-utils"
 import {
     COMPRESSED_BLOCK_HEADER,
@@ -86,14 +88,29 @@ export function createCompressRangeTool(ctx: ToolContext): ReturnType<typeof too
 
             for (const plan of resolvedPlans) {
                 const parsedPlaceholders = parseBlockPlaceholders(plan.entry.summary)
-                const consumedBlockIds = collectConsumedBlockIds(
+                const missingBlockIds = validateSummaryPlaceholders(
+                    parsedPlaceholders,
                     plan.selection.requiredBlockIds,
+                    plan.selection.startReference,
+                    plan.selection.endReference,
+                    searchContext.summaryByBlockId,
+                )
+                const injectedSummary = injectBlockPlaceholders(
+                    plan.entry.summary,
                     parsedPlaceholders,
                     searchContext.summaryByBlockId,
+                    plan.selection.startReference,
+                    plan.selection.endReference,
+                )
+                const carriedSummary = appendMissingBlockSummaries(
+                    injectedSummary.expandedSummary,
+                    missingBlockIds,
+                    searchContext.summaryByBlockId,
+                    injectedSummary.consumedBlockIds,
                 )
 
                 const summaryWithUsers = appendProtectedUserMessages(
-                    plan.entry.summary,
+                    carriedSummary.expandedSummary,
                     plan.selection,
                     searchContext,
                     ctx.state,
@@ -124,7 +141,7 @@ export function createCompressRangeTool(ctx: ToolContext): ReturnType<typeof too
                     selection: plan.selection,
                     anchorMessageId: plan.anchorMessageId,
                     finalSummary: summaryWithTools,
-                    consumedBlockIds,
+                    consumedBlockIds: carriedSummary.consumedBlockIds,
                 })
             }
 

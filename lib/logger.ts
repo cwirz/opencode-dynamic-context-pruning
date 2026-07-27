@@ -2,15 +2,26 @@ import { writeFile, mkdir } from "fs/promises"
 import { join } from "path"
 import { existsSync } from "fs"
 import { homedir } from "os"
+import { type ContextSnapshot, writeContextViewer } from "./context-debug"
 
 export class Logger {
     private logDir: string
+    private systemBySession = new Map<string, string[]>()
+    private latestSnapshotBySession = new Map<
+        string,
+        {
+            contextDir: string
+            fileStem: string
+            snapshot: ContextSnapshot
+            savedAt: number
+        }
+    >()
     public enabled: boolean
 
-    constructor(enabled: boolean) {
+    constructor(enabled: boolean, logDir?: string) {
         this.enabled = enabled
         const configHome = process.env.XDG_CONFIG_HOME || join(homedir(), ".config")
-        this.logDir = join(configHome, "opencode", "logs", "dcp")
+        this.logDir = logDir || join(configHome, "opencode", "logs", "dcp")
     }
 
     private async ensureLogDir() {
@@ -108,102 +119,45 @@ export class Logger {
         return this.write("ERROR", component, message, data)
     }
 
-    /**
-     * Strips unnecessary metadata from messages for cleaner debug logs.
-     *
-     * Removed:
-     * - All IDs (id, sessionID, messageID, parentID)
-     * - summary, path, cost, model, agent, mode, finish, providerID, modelID
-     * - step-start and step-finish parts entirely
-     * - snapshot fields
-     * - ignored text parts
-     *
-     * Kept:
-     * - role, time (created only), tokens (input, output, reasoning, cache)
-     * - text, reasoning, tool parts with content
-     * - tool calls with: tool, callID, input, output, metadata
-     */
-    private minimizeForDebug(messages: any[]): any[] {
-        return messages.map((msg) => {
-            const minimized: any = {
-                role: msg.info?.role,
+    async captureSystemContext(sessionId: string, system: string[]) {
+        if (!this.enabled) return
+        const capturedSystem = [...system]
+        this.systemBySession.set(sessionId, capturedSystem)
+
+        // OpenCode runs message transforms before system transforms. Rewrite the
+        // just-written snapshot so both halves represent the same model request.
+        const latest = this.latestSnapshotBySession.get(sessionId)
+        if (!latest || Date.now() - latest.savedAt > 5_000) return
+
+        try {
+            latest.snapshot.system = capturedSystem
+            await writeFile(
+                join(latest.contextDir, `${latest.fileStem}.json`),
+                JSON.stringify(latest.snapshot, null, 2),
+            )
+            await writeContextViewer(latest.contextDir, latest.fileStem, latest.snapshot)
+        } catch (error) {}
+    }
+
+    async captureRequestContext(sessionId: string, input: any, output: any) {
+        if (!this.enabled) return
+
+        const latest = this.latestSnapshotBySession.get(sessionId)
+        if (!latest || Date.now() - latest.savedAt > 5_000) return
+
+        try {
+            latest.snapshot.request = { input, output }
+            const finalInstructions = output?.options?.instructions
+            if (typeof finalInstructions === "string") {
+                latest.snapshot.system = [finalInstructions]
+                this.systemBySession.set(sessionId, [finalInstructions])
             }
-
-            if (msg.info?.time?.created) {
-                minimized.time = msg.info.time.created
-            }
-
-            if (msg.info?.tokens) {
-                minimized.tokens = {
-                    input: msg.info.tokens.input,
-                    output: msg.info.tokens.output,
-                    reasoning: msg.info.tokens.reasoning,
-                    cache: msg.info.tokens.cache,
-                }
-            }
-
-            if (msg.parts) {
-                minimized.parts = msg.parts
-                    .map((part: any) => {
-                        if (part.type === "step-start" || part.type === "step-finish") {
-                            return null
-                        }
-
-                        if (part.type === "text") {
-                            if (part.ignored) return null
-                            const textPart: any = { type: "text", text: part.text }
-                            if (part.metadata) textPart.metadata = part.metadata
-                            return textPart
-                        }
-
-                        if (part.type === "reasoning") {
-                            const reasoningPart: any = { type: "reasoning", text: part.text }
-                            if (part.metadata) reasoningPart.metadata = part.metadata
-                            return reasoningPart
-                        }
-
-                        if (part.type === "tool") {
-                            const toolPart: any = {
-                                type: "tool",
-                                tool: part.tool,
-                                callID: part.callID,
-                            }
-
-                            if (part.state?.status) {
-                                toolPart.status = part.state.status
-                            }
-                            if (part.state?.input) {
-                                toolPart.input = part.state.input
-                            }
-                            if (part.state?.output) {
-                                toolPart.output = part.state.output
-                            }
-                            if (part.state?.error) {
-                                toolPart.error = part.state.error
-                            }
-                            if (part.metadata) {
-                                toolPart.metadata = part.metadata
-                            }
-                            if (part.state?.metadata) {
-                                toolPart.metadata = {
-                                    ...(toolPart.metadata || {}),
-                                    ...part.state.metadata,
-                                }
-                            }
-                            if (part.state?.title) {
-                                toolPart.title = part.state.title
-                            }
-
-                            return toolPart
-                        }
-
-                        return null
-                    })
-                    .filter(Boolean)
-            }
-
-            return minimized
-        })
+            await writeFile(
+                join(latest.contextDir, `${latest.fileStem}.json`),
+                JSON.stringify(latest.snapshot, null, 2),
+            )
+            await writeContextViewer(latest.contextDir, latest.fileStem, latest.snapshot)
+        } catch (error) {}
     }
 
     async saveContext(sessionId: string, messages: any[]) {
@@ -215,12 +169,24 @@ export class Logger {
                 await mkdir(contextDir, { recursive: true })
             }
 
-            const minimized = this.minimizeForDebug(messages).filter(
-                (msg) => msg.parts && msg.parts.length > 0,
-            )
-            const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
+            const capturedAt = new Date().toISOString()
+            const timestamp = capturedAt.replace(/[:.]/g, "-")
+            const snapshot: ContextSnapshot = {
+                version: 1,
+                capturedAt,
+                sessionId,
+                system: this.systemBySession.get(sessionId) || [],
+                messages,
+            }
             const contextFile = join(contextDir, `${timestamp}.json`)
-            await writeFile(contextFile, JSON.stringify(minimized, null, 2))
+            await writeFile(contextFile, JSON.stringify(snapshot, null, 2))
+            await writeContextViewer(contextDir, timestamp, snapshot)
+            this.latestSnapshotBySession.set(sessionId, {
+                contextDir,
+                fileStem: timestamp,
+                snapshot,
+                savedAt: Date.now(),
+            })
         } catch (error) {}
     }
 }

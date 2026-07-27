@@ -77,7 +77,13 @@ function textPart(messageID: string, sessionID: string, id: string, text: string
     }
 }
 
-function toolPart(messageID: string, sessionID: string, callID: string, toolName: string, output: string) {
+function toolPart(
+    messageID: string,
+    sessionID: string,
+    callID: string,
+    toolName: string,
+    output: string,
+) {
     return {
         id: `${callID}-part`,
         messageID,
@@ -400,7 +406,7 @@ test("compress range mode rejects overlapping batched ranges", async () => {
     assert.equal(state.prune.messages.blocksById.size, 0)
 })
 
-test("compress range mode recompresses active blocks without copying prior summaries", async () => {
+test("compress range mode carries active block context forward", async () => {
     const sessionID = `ses_range_recompress_${Date.now()}`
     const rawMessages: WithParts[] = [
         {
@@ -422,7 +428,9 @@ test("compress range mode recompresses active blocks without copying prior summa
                 agent: "assistant",
                 time: { created: 2 },
             } as WithParts["info"],
-            parts: [textPart("msg-assistant-1", sessionID, "part-assistant-1", "OLD_VERBOSE_DETAIL")],
+            parts: [
+                textPart("msg-assistant-1", sessionID, "part-assistant-1", "OLD_VERBOSE_DETAIL"),
+            ],
         },
         {
             info: {
@@ -478,7 +486,7 @@ test("compress range mode recompresses active blocks without copying prior summa
                 {
                     startId: "b1",
                     endId: "m0003",
-                    summary: "Decision kept; verbose old details intentionally dropped.",
+                    summary: "Decision kept; verbose old details intentionally dropped. (b1)",
                 },
             ],
         },
